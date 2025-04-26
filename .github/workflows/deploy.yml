@@ -1,52 +1,70 @@
-name: CI/CD - ECS Blue-Green Deployment
+name: Deploy to ECS Blue-Green
 
 on:
   push:
     branches:
       - main
 
-env:
-  AWS_REGION: us-east-1
-  APP_NAME: sampleecsapp
-  ECR_REPOSITORY: sampleecsapp
-  TF_VERSION: 1.6.6
-
 jobs:
   deploy:
-    name: Build, Push, Deploy
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPO: sampleecsapp
+      CLUSTER_NAME: sampleecsapp-cluster
+      SERVICE_NAME_BLUE: sampleecsapp-blue
+      SERVICE_NAME_GREEN: sampleecsapp-green
+      LOAD_BALANCER_ARN: arn:aws:elasticloadbalancing:us-east-1:<your-account-id>:loadbalancer/app/sampleecsapp-alb/xxxxxxxxxxxxxxx
+      TARGET_GROUP_BLUE: arn:aws:elasticloadbalancing:us-east-1:<your-account-id>:targetgroup/blue-tg/yyyyyyyyyyyyyyy
+      TARGET_GROUP_GREEN: arn:aws:elasticloadbalancing:us-east-1:<your-account-id>:targetgroup/green-tg/zzzzzzzzzzzzzzz
+      LISTENER_ARN: arn:aws:elasticloadbalancing:us-east-1:<your-account-id>:listener/app/sampleecsapp-alb/xxxxxxxxxxxxxxx/yyyyyyyyyyyyyyy
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      - name: Build and Push Docker image
+        run: |
+          IMAGE_TAG=$(date +%s)
+          docker build -t $ECR_REPO:$IMAGE_TAG .
+          docker tag $ECR_REPO:$IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:$IMAGE_TAG
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:$IMAGE_TAG
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-    - name: Build and push Docker image
-      run: |
-        docker build -t $APP_NAME .
-        docker tag $APP_NAME:latest ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest
-        docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest
+      - name: Update ECS Green service with new image
+        run: |
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME_GREEN \
+            --force-new-deployment \
+            --desired-count 1
 
-    - name: Install Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Wait for ECS Green service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME_GREEN
 
-    - name: Terraform Init
-      run: terraform init
+      - name: Switch traffic to Green target group
+        run: |
+          aws elbv2 modify-listener \
+            --listener-arn $LISTENER_ARN \
+            --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_GREEN
 
-    - name: Terraform Apply
-      run: terraform apply -auto-approve
+      - name: Scale down Blue service
+        run: |
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME_BLUE \
+            --desired-count 0
